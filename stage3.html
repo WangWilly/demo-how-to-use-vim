@@ -1,0 +1,862 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vim 練習 - Stage 3 Ultimate</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html, body, #root { height: 100%; margin: 0; }
+    .animate-pulse-fast { animation: pulse 0.8s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+  </style>
+</head>
+<body>
+  <!-- Back link -->
+  <div style="position:fixed;top:12px;left:12px;z-index:200;">
+    <a href="index.html" style="background:#161b22;color:#8b949e;padding:6px 12px;border-radius:6px;text-decoration:none;font-family:monospace;font-size:12px;border:1px solid #30363d;">← 返回</a>
+  </div>
+
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    const initialText = [
+      "// Vim Ultimate Edition - The Hacker's Playground",
+      "// Welcome to the true power of Vim.",
+      "",
+      "// NEW: AI Powered by Gemini API!",
+      "// Try the ✨ buttons at the top right to generate or explain code.",
+      "",
+      "function learnTextObjects() {",
+      "  const greeting = 'Hello Vim';",
+      "  // 1. Text Objects (文字物件) - Vim 的靈魂！",
+      "  // 試著把游標放在 'objects' 或 'greeting' 中間",
+      "  // 按 ciw (Change Inner Word): 刪除整個單字並進入插入模式",
+      "  // 按 diw (Delete Inner Word): 刪除整個單字",
+      "  // 按 yiw (Yank Inner Word): 複製整個單字",
+      "  console.log('You just used text objects!');",
+      "}",
+      "",
+      "function learnVisualMode() {",
+      "  // 2. Visual Mode (視覺模式)",
+      "  // 按 v 進入視覺模式，移動游標選取文字",
+      "  // 選取後按 d 刪除，或按 y 複製",
+      "  const array = [1, 2, 3, 4, 5];",
+      "  return array;",
+      "}",
+      "",
+      "// 3. Navigation (快速導航)",
+      "// 按 gg 跳到檔案最頂端",
+      "// 按 G (大寫) 跳到檔案最底端",
+      "// 按 Ctrl + u / Ctrl + d 上下滾動半頁",
+      "",
+      "// Practice area:",
+      "const myAwesomeVariable = 42;",
+      "const redundantCode = 'Delete me with dd';",
+      "// Move your cursor around and start hacking!"
+    ];
+
+    const VimPracticeTool = () => {
+      const [text, setText] = useState([...initialText]);
+      const [cursor, setCursor] = useState({ line: 0, col: 0 });
+      const [mode, setMode] = useState('NORMAL'); // NORMAL, INSERT, VISUAL
+      const [visualStart, setVisualStart] = useState(null);
+      const [commandBuffer, setCommandBuffer] = useState({ count: '', cmd: '', modifier: '' });
+      const [history, setHistory] = useState([]);
+      const [redoStack, setRedoStack] = useState([]);
+      const [register, setRegister] = useState(null); 
+      const [scrollOffset, setScrollOffset] = useState(0);
+      const LINES_PER_PAGE = 15;
+      const [isFocused, setIsFocused] = useState(false);
+      const containerRef = useRef(null);
+
+      // AI 功能狀態管理
+      const [aiModal, setAiModal] = useState(null);
+      const [aiPrompt, setAiPrompt] = useState("");
+      const [aiResponse, setAiResponse] = useState("");
+      const [aiLoading, setAiLoading] = useState(false);
+
+      const saveHistory = useCallback(() => {
+        setHistory(prev => [...prev, { text: [...text], cursor: { ...cursor } }]);
+        setRedoStack([]);
+      }, [text, cursor]);
+
+      const clampCol = (lineIdx, colIdx, currentText = text, currentMode = mode) => {
+        const lineStr = currentText[lineIdx] || "";
+        const maxCol = currentMode === 'INSERT' ? lineStr.length : Math.max(0, lineStr.length - 1);
+        return Math.max(0, Math.min(colIdx, maxCol));
+      };
+
+      const getWordBoundaries = (line, col) => {
+        const lineStr = text[line];
+        if (!lineStr || lineStr.length === 0) return null;
+        const isSpace = lineStr[col] === ' ';
+        let start = col;
+        while (start > 0 && (lineStr[start - 1] === ' ') === isSpace) start--;
+        let end = col;
+        while (end < lineStr.length - 1 && (lineStr[end + 1] === ' ') === isSpace) end++;
+        return { start, end };
+      };
+
+      const extractVisualText = () => {
+        if (mode === 'VISUAL' && visualStart) {
+          let startLine = visualStart.line, startCol = visualStart.col;
+          let endLine = cursor.line, endCol = cursor.col;
+          if (startLine > endLine || (startLine === endLine && startCol > endCol)) {
+            [startLine, endLine] = [endLine, startLine];
+            [startCol, endCol] = [endCol, startCol];
+          }
+          if (startLine === endLine) return text[startLine].substring(startCol, endCol + 1);
+          let res = [text[startLine].substring(startCol)];
+          for (let i = startLine + 1; i < endLine; i++) res.push(text[i]);
+          res.push(text[endLine].substring(0, endCol + 1));
+          return res.join('\n');
+        }
+        return text[cursor.line];
+      };
+
+      const callGemini = async (promptText) => {
+        const apiKey = ""; 
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+        const payload = { contents: [{ parts: [{ text: promptText }] }] };
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        const delays = [1000, 2000, 4000, 8000, 16000];
+        for (let i = 0; i < 6; i++) {
+          try {
+            const res = await fetch(url, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+            const data = await res.json();
+            return data.candidates?.[0]?.content?.parts?.[0]?.text || "Error: No response generated.";
+          } catch (err) {
+            if (i === 5) throw err;
+            await sleep(delays[i]);
+          }
+        }
+      };
+
+      const handleGenerateCode = async () => {
+        if (!aiPrompt.trim()) return;
+        setAiLoading(true);
+        try {
+          const result = await callGemini(`Write concise, raw code for the following request: "${aiPrompt}". Output ONLY the raw code, no markdown formatting, no backticks, no explanations. Just the code.`);
+          saveHistory();
+          let cleaned = result.trim().replace(/^```[a-z]*\n/gi, '').replace(/\n```$/g, '');
+          const lines = cleaned.split('\n');
+          const newText = [...text];
+          newText.splice(cursor.line + 1, 0, ...lines);
+          setText(newText);
+          setCursor({ line: cursor.line + 1, col: 0 });
+          setAiModal(null);
+          setAiPrompt("");
+          containerRef.current?.focus();
+        } catch (e) {
+          console.error(e);
+          alert("AI Generation failed. Please add a valid Gemini API key.");
+        }
+        setAiLoading(false);
+      };
+
+      const handleExplainCode = async () => {
+        const codeToExplain = extractVisualText();
+        if (!codeToExplain || !codeToExplain.trim()) return;
+        setAiModal('explain_result');
+        setAiLoading(true);
+        setAiResponse("");
+        try {
+          const result = await callGemini(`As an expert programmer, explain the following code concisely:\n\n${codeToExplain}`);
+          setAiResponse(result);
+        } catch (e) {
+          setAiResponse("Failed to fetch explanation from Gemini API. Please add a valid API key.");
+        }
+        setAiLoading(false);
+      };
+
+      const ensureVisible = (lineIdx) => {
+        if (lineIdx < scrollOffset) {
+          setScrollOffset(Math.max(0, lineIdx - 2));
+        } else if (lineIdx >= scrollOffset + LINES_PER_PAGE) {
+          setScrollOffset(Math.min(text.length - LINES_PER_PAGE, lineIdx - LINES_PER_PAGE + 3));
+        }
+      };
+
+      const handleKeyDown = (e) => {
+        if (!isFocused || aiModal) return;
+        if ([' ', 'Backspace', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key) || 
+            (e.ctrlKey && ['r', 'd', 'u', 'c', 'v'].includes(e.key))) {
+          e.preventDefault();
+        }
+        if (mode === 'NORMAL') {
+          handleNormalModeKey(e);
+        } else if (mode === 'INSERT') {
+          handleInsertModeKey(e);
+        } else if (mode === 'VISUAL') {
+          handleVisualModeKey(e);
+        }
+        setTimeout(() => ensureVisible(cursor.line), 0);
+      };
+
+      const handleVisualModeKey = (e) => {
+        const { key } = e;
+        let newCursor = { ...cursor };
+        let newText = [...text];
+
+        if (key === 'Escape' || key === 'v') {
+          setMode('NORMAL');
+          setVisualStart(null);
+          return;
+        }
+
+        let moved = false;
+        switch(key) {
+          case 'h': case 'ArrowLeft': newCursor.col = Math.max(0, cursor.col - 1); moved = true; break;
+          case 'l': case 'ArrowRight': newCursor.col = clampCol(cursor.line, cursor.col + 1, text, 'VISUAL'); moved = true; break;
+          case 'j': case 'ArrowDown': newCursor.line = Math.min(text.length - 1, cursor.line + 1); newCursor.col = clampCol(newCursor.line, cursor.col, text, 'VISUAL'); moved = true; break;
+          case 'k': case 'ArrowUp': newCursor.line = Math.max(0, cursor.line - 1); newCursor.col = clampCol(newCursor.line, cursor.col, text, 'VISUAL'); moved = true; break;
+          case '0': newCursor.col = 0; moved = true; break;
+          case '$': newCursor.col = clampCol(cursor.line, text[cursor.line].length, text, 'VISUAL'); moved = true; break;
+        }
+
+        if (moved) { setCursor(newCursor); return; }
+
+        if (key === 'd' || key === 'x' || key === 'y') {
+          const isYank = key === 'y';
+          if (!isYank) saveHistory();
+
+          let startLine = visualStart.line, startCol = visualStart.col;
+          let endLine = cursor.line, endCol = cursor.col;
+          if (startLine > endLine || (startLine === endLine && startCol > endCol)) {
+            [startLine, endLine] = [endLine, startLine];
+            [startCol, endCol] = [endCol, startCol];
+          }
+
+          let extractedContent = [];
+          if (startLine === endLine) {
+            const lineStr = newText[startLine];
+            extractedContent = [lineStr.substring(startCol, endCol + 1)];
+            if (!isYank) newText[startLine] = lineStr.substring(0, startCol) + lineStr.substring(endCol + 1);
+          } else {
+            extractedContent.push(newText[startLine].substring(startCol));
+            for (let i = startLine + 1; i < endLine; i++) extractedContent.push(newText[i]);
+            extractedContent.push(newText[endLine].substring(0, endCol + 1));
+            if (!isYank) {
+              const newLineStr = newText[startLine].substring(0, startCol) + newText[endLine].substring(endCol + 1);
+              newText.splice(startLine, endLine - startLine + 1, newLineStr);
+            }
+          }
+
+          setRegister({ type: 'char', content: extractedContent });
+          setMode('NORMAL');
+          setVisualStart(null);
+          if (!isYank) {
+            newCursor = { line: startLine, col: clampCol(startLine, startCol, newText, 'NORMAL') };
+            setText(newText);
+          } else {
+            newCursor = { line: startLine, col: startCol };
+          }
+          setCursor(newCursor);
+        }
+      };
+
+      const handleNormalModeKey = (e) => {
+        const { key, ctrlKey } = e;
+        let newCursor = { ...cursor };
+        let newText = [...text];
+        let bufCountStr = commandBuffer.count;
+        let bufCmd = commandBuffer.cmd;
+        let bufMod = commandBuffer.modifier;
+
+        if (ctrlKey) {
+          if (key === 'r') {
+            if (redoStack.length > 0) {
+              const nextState = redoStack[redoStack.length - 1];
+              setHistory(prev => [...prev, { text: [...text], cursor: { ...cursor } }]);
+              setText(nextState.text);
+              setCursor(nextState.cursor);
+              setRedoStack(prev => prev.slice(0, -1));
+            }
+            return;
+          }
+          if (key === 'd') {
+            newCursor.line = Math.min(text.length - 1, cursor.line + Math.floor(LINES_PER_PAGE/2));
+            setCursor(newCursor); return;
+          }
+          if (key === 'u') {
+            newCursor.line = Math.max(0, cursor.line - Math.floor(LINES_PER_PAGE/2));
+            setCursor(newCursor); return;
+          }
+        }
+
+        if (key === 'Escape') {
+          setCommandBuffer({ count: '', cmd: '', modifier: '' });
+          return;
+        }
+
+        if (!bufCmd && /^[1-9]$/.test(key) && bufCountStr === '') {
+          setCommandBuffer({ ...commandBuffer, count: key }); return;
+        } else if (!bufCmd && /^[0-9]$/.test(key) && bufCountStr !== '') {
+          setCommandBuffer({ ...commandBuffer, count: bufCountStr + key }); return;
+        }
+
+        const count = parseInt(bufCountStr) || 1;
+
+        if (bufCmd && (bufCmd === 'c' || bufCmd === 'd' || bufCmd === 'y') && !bufMod) {
+          if (key === 'i' || key === 'a') {
+            setCommandBuffer({ ...commandBuffer, modifier: key }); return;
+          }
+        }
+
+        if (bufCmd && bufMod === 'i' && key === 'w') {
+          const bounds = getWordBoundaries(cursor.line, cursor.col);
+          if (bounds) {
+            if (bufCmd === 'c' || bufCmd === 'd') saveHistory();
+            const lineStr = newText[cursor.line];
+            const extracted = lineStr.substring(bounds.start, bounds.end + 1);
+            setRegister({ type: 'char', content: [extracted] });
+            if (bufCmd === 'c' || bufCmd === 'd') {
+              newText[cursor.line] = lineStr.substring(0, bounds.start) + lineStr.substring(bounds.end + 1);
+              newCursor.col = bufCmd === 'c' ? bounds.start : clampCol(cursor.line, bounds.start, newText, 'NORMAL');
+              setText(newText);
+            }
+            if (bufCmd === 'c') setMode('INSERT');
+          }
+          setCommandBuffer({ count: '', cmd: '', modifier: '' });
+          setCursor(newCursor);
+          return;
+        }
+
+        if (bufCmd === 'f') {
+          if (key.length === 1) { 
+            const lineStr = text[cursor.line];
+            let foundIdx = cursor.col;
+            let matchCount = 0;
+            for (let i = cursor.col + 1; i < lineStr.length; i++) {
+              if (lineStr[i] === key) {
+                matchCount++;
+                if (matchCount === count) { foundIdx = i; break; }
+              }
+            }
+            newCursor.col = foundIdx;
+            setCursor(newCursor);
+          }
+          setCommandBuffer({ count: '', cmd: '', modifier: '' });
+          return;
+        }
+
+        if (bufCmd === 'g' && key === 'g') {
+          newCursor.line = 0;
+          newCursor.col = clampCol(0, cursor.col, text, 'NORMAL');
+          setCursor(newCursor);
+          setCommandBuffer({ count: '', cmd: '', modifier: '' });
+          return;
+        }
+
+        if (bufCmd === 'd' || bufCmd === 'y' || bufCmd === 'c') {
+          if (key === bufCmd) {
+            if (bufCmd !== 'y') saveHistory();
+            const linesToProcess = Math.min(count, newText.length - cursor.line);
+            const extractedLines = newText.slice(cursor.line, cursor.line + linesToProcess);
+            setRegister({ type: 'line', content: extractedLines });
+            if (bufCmd !== 'y') {
+              newText.splice(cursor.line, linesToProcess);
+              if (newText.length === 0) newText.push(""); 
+              if (bufCmd === 'c') {
+                newText.splice(cursor.line, 0, "");
+                setMode('INSERT');
+                newCursor.col = 0;
+              } else {
+                newCursor.line = Math.min(cursor.line, newText.length - 1);
+                newCursor.col = clampCol(newCursor.line, 0, newText, 'NORMAL');
+              }
+              setText(newText);
+            }
+          } else if (key === 'w') {
+            const lineStr = newText[cursor.line];
+            let delStart = cursor.col;
+            let delEnd = cursor.col;
+            for (let i = 0; i < count; i++) {
+              while (delEnd < lineStr.length && lineStr[delEnd] !== ' ') delEnd++;
+              if (bufCmd !== 'c') {
+                while (delEnd < lineStr.length && lineStr[delEnd] === ' ') delEnd++;
+              }
+            }
+            setRegister({ type: 'char', content: [lineStr.substring(delStart, delEnd)] });
+            if (bufCmd !== 'y') {
+              saveHistory();
+              newText[cursor.line] = lineStr.substring(0, delStart) + lineStr.substring(delEnd);
+              newCursor.col = delStart;
+              setText(newText);
+              if (bufCmd === 'c') setMode('INSERT');
+            }
+          }
+          setCursor(newCursor);
+          setCommandBuffer({ count: '', cmd: '', modifier: '' });
+          return;
+        }
+
+        let handled = true;
+        switch (key) {
+          case 'v':
+            setMode('VISUAL');
+            setVisualStart({ line: cursor.line, col: cursor.col });
+            break;
+          case 'd': case 'y': case 'c': case 'f': case 'g':
+            setCommandBuffer({ ...commandBuffer, cmd: key });
+            return; 
+          case 'G':
+            newCursor.line = text.length - 1;
+            newCursor.col = clampCol(newCursor.line, cursor.col, text, 'NORMAL');
+            break;
+          case 'h': case 'ArrowLeft': newCursor.col = Math.max(0, cursor.col - count); break;
+          case 'l': case 'ArrowRight': newCursor.col = clampCol(cursor.line, cursor.col + count, text, 'NORMAL'); break;
+          case 'j': case 'ArrowDown': newCursor.line = Math.min(text.length - 1, cursor.line + count); newCursor.col = clampCol(newCursor.line, cursor.col, text, 'NORMAL'); break;
+          case 'k': case 'ArrowUp': newCursor.line = Math.max(0, cursor.line - count); newCursor.col = clampCol(newCursor.line, cursor.col, text, 'NORMAL'); break;
+          case '0': newCursor.col = 0; break;
+          case '$': newCursor.col = clampCol(cursor.line, text[cursor.line].length, text, 'NORMAL'); break;
+          case 'w': {
+            let tempCursor = { ...cursor };
+            for (let i = 0; i < count; i++) {
+              const lineStr = text[tempCursor.line];
+              let nextIdx = tempCursor.col + 1;
+              while (nextIdx < lineStr.length && lineStr[nextIdx] !== ' ') nextIdx++;
+              while (nextIdx < lineStr.length && lineStr[nextIdx] === ' ') nextIdx++;
+              if (nextIdx >= lineStr.length && tempCursor.line < text.length - 1) { tempCursor.line += 1; tempCursor.col = 0; } 
+              else { tempCursor.col = clampCol(tempCursor.line, nextIdx, text, 'NORMAL'); }
+            }
+            newCursor = tempCursor;
+            break;
+          }
+          case 'b': {
+            let tempCursor = { ...cursor };
+            for (let i = 0; i < count; i++) {
+              let prevIdx = tempCursor.col - 1;
+              const lineStr = text[tempCursor.line];
+              while (prevIdx >= 0 && lineStr[prevIdx] === ' ') prevIdx--;
+              while (prevIdx >= 0 && lineStr[prevIdx] !== ' ') prevIdx--;
+              if (prevIdx < 0 && tempCursor.line > 0) { tempCursor.line -= 1; tempCursor.col = clampCol(tempCursor.line, text[tempCursor.line].length, text, 'NORMAL'); } 
+              else { tempCursor.col = prevIdx + 1; }
+            }
+            newCursor = tempCursor;
+            break;
+          }
+          case 'x':
+            if (text[cursor.line].length > 0) {
+              saveHistory();
+              const lineStr = newText[cursor.line];
+              const delCount = Math.min(count, lineStr.length - cursor.col);
+              setRegister({ type: 'char', content: [lineStr.slice(cursor.col, cursor.col + delCount)] });
+              newText[cursor.line] = lineStr.slice(0, cursor.col) + lineStr.slice(cursor.col + delCount);
+              newCursor.col = clampCol(cursor.line, cursor.col, newText, 'NORMAL');
+              setText(newText);
+            }
+            break;
+          case 'p':
+            if (register) {
+              saveHistory();
+              if (register.type === 'line') {
+                let insertIdx = cursor.line + 1;
+                for (let c = 0; c < count; c++) { newText.splice(insertIdx, 0, ...register.content); insertIdx += register.content.length; }
+                newCursor.line = cursor.line + 1;
+                newCursor.col = clampCol(newCursor.line, 0, newText, 'NORMAL');
+              } else if (register.type === 'char') {
+                const lineStr = newText[cursor.line];
+                const insertPos = cursor.col + (lineStr.length > 0 ? 1 : 0);
+                let toInsert = register.content[0].repeat(count);
+                newText[cursor.line] = lineStr.slice(0, insertPos) + toInsert + lineStr.slice(insertPos);
+                newCursor.col = insertPos + toInsert.length - 1;
+              }
+              setText(newText);
+            }
+            break;
+          case 'P':
+            if (register) {
+              saveHistory();
+              if (register.type === 'line') {
+                let insertIdx = cursor.line;
+                for (let c = 0; c < count; c++) { newText.splice(insertIdx, 0, ...register.content); insertIdx += register.content.length; }
+                newCursor.line = cursor.line;
+                newCursor.col = clampCol(newCursor.line, 0, newText, 'NORMAL');
+              } else if (register.type === 'char') {
+                const lineStr = newText[cursor.line];
+                let toInsert = register.content[0].repeat(count);
+                newText[cursor.line] = lineStr.slice(0, cursor.col) + toInsert + lineStr.slice(cursor.col);
+                newCursor.col = cursor.col + toInsert.length - 1;
+              }
+              setText(newText);
+            }
+            break;
+          case 'i': setMode('INSERT'); break;
+          case 'I': newCursor.col = 0; setMode('INSERT'); break;
+          case 'a': newCursor.col = Math.min(text[cursor.line].length, cursor.col + 1); setMode('INSERT'); break;
+          case 'A': newCursor.col = text[cursor.line].length; setMode('INSERT'); break;
+          case 'o': saveHistory(); newText.splice(cursor.line + 1, 0, ""); newCursor.line += 1; newCursor.col = 0; setText(newText); setMode('INSERT'); break;
+          case 'O': saveHistory(); newText.splice(cursor.line, 0, ""); newCursor.col = 0; setText(newText); setMode('INSERT'); break;
+          case 'u':
+            if (history.length > 0) {
+              const lastState = history[history.length - 1];
+              setRedoStack(prev => [...prev, { text: [...text], cursor: { ...cursor } }]);
+              setText(lastState.text);
+              setCursor(lastState.cursor);
+              setHistory(history.slice(0, -1));
+            }
+            break;
+          default: handled = false; break;
+        }
+        
+        if (handled) {
+          setCursor(newCursor);
+          setCommandBuffer({ count: '', cmd: '', modifier: '' }); 
+        }
+      };
+
+      const handleInsertModeKey = (e) => {
+        const { key } = e;
+        let newCursor = { ...cursor };
+        let newText = [...text];
+
+        if (key === 'Escape') {
+          setMode('NORMAL');
+          setCursor({ ...cursor, col: Math.max(0, cursor.col - 1) });
+          return;
+        }
+
+        saveHistory(); 
+
+        if (key === 'Backspace') {
+          if (cursor.col > 0) {
+            const lineStr = newText[cursor.line];
+            newText[cursor.line] = lineStr.slice(0, cursor.col - 1) + lineStr.slice(cursor.col);
+            newCursor.col -= 1;
+            setText(newText); setCursor(newCursor);
+          } else if (cursor.line > 0) {
+            const prevLineLen = newText[cursor.line - 1].length;
+            newText[cursor.line - 1] += newText[cursor.line];
+            newText.splice(cursor.line, 1);
+            newCursor.line -= 1; newCursor.col = prevLineLen;
+            setText(newText); setCursor(newCursor);
+          }
+        } else if (key === 'Enter') {
+          const lineStr = newText[cursor.line];
+          const nextLineStr = lineStr.slice(cursor.col);
+          newText[cursor.line] = lineStr.slice(0, cursor.col);
+          newText.splice(cursor.line + 1, 0, nextLineStr);
+          newCursor.line += 1; newCursor.col = 0;
+          setText(newText); setCursor(newCursor);
+        } else if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          const lineStr = newText[cursor.line];
+          newText[cursor.line] = lineStr.slice(0, cursor.col) + key + lineStr.slice(cursor.col);
+          newCursor.col += 1;
+          setText(newText); setCursor(newCursor);
+        } else {
+          setHistory(prev => prev.slice(0, -1));
+        }
+      };
+
+      const isSelected = (lineIdx, colIdx) => {
+        if (mode !== 'VISUAL' || !visualStart) return false;
+        let startLine = visualStart.line, startCol = visualStart.col;
+        let endLine = cursor.line, endCol = cursor.col;
+        if (startLine > endLine || (startLine === endLine && startCol > endCol)) {
+          [startLine, endLine] = [endLine, startLine];
+          [startCol, endCol] = [endCol, startCol];
+        }
+        if (lineIdx < startLine || lineIdx > endLine) return false;
+        if (startLine === endLine) return colIdx >= startCol && colIdx <= endCol;
+        if (lineIdx === startLine) return colIdx >= startCol;
+        if (lineIdx === endLine) return colIdx <= endCol;
+        return true;
+      };
+
+      const getHighlightClass = (char, lineStr, inComment) => {
+        if (inComment) return 'text-[#7a828e] italic';
+        if (/[0-9]/.test(char)) return 'text-[#79c0ff]';
+        if (/[=\+\-\*\/]/.test(char)) return 'text-[#ff7b72]';
+        if (/[{}\(\)\[\]]/.test(char)) return 'text-[#d2a8ff]';
+        if (/['";]/.test(char)) return 'text-[#a5d6ff]';
+        return 'text-[#c9d1d9]';
+      };
+
+      const displayBufferStr = `${commandBuffer.count}${commandBuffer.cmd}${commandBuffer.modifier}`;
+
+      const renderText = () => {
+        const visibleText = text.slice(scrollOffset, scrollOffset + LINES_PER_PAGE);
+        return visibleText.map((line, relativeIdx) => {
+          const lineIdx = scrollOffset + relativeIdx;
+          const isCurrentLine = cursor.line === lineIdx;
+          const inComment = line.trim().startsWith('//');
+          
+          if (line.length === 0) {
+            if (isCurrentLine) {
+              return (
+                <div key={lineIdx} className="h-6 leading-6 flex">
+                  <div className="w-8 shrink-0 text-right pr-3 text-[#484f58] select-none text-xs leading-6">{lineIdx + 1}</div>
+                  <span className={`inline-block ${mode === 'NORMAL' ? 'bg-[#ffeb3b] w-2.5 h-5 align-middle opacity-90' : 'border-l-2 border-[#ffeb3b] h-5 align-middle'}`}>&nbsp;</span>
+                </div>
+              );
+            }
+            return (
+              <div key={lineIdx} className="h-6 leading-6 flex">
+                <div className="w-8 shrink-0 text-right pr-3 text-[#484f58] select-none text-xs leading-6">{lineIdx + 1}</div>
+              </div>
+            );
+          }
+
+          const chars = line.split('');
+          if (mode === 'INSERT' && isCurrentLine && cursor.col === line.length) chars.push(''); 
+
+          return (
+            <div key={lineIdx} className={`h-6 leading-6 whitespace-pre font-mono flex ${isCurrentLine && mode !== 'VISUAL' ? 'bg-[#21262d]/50' : ''}`}>
+              <div className={`w-8 shrink-0 text-right pr-3 select-none text-xs leading-6 ${isCurrentLine ? 'text-[#e6edf3] font-bold' : 'text-[#484f58]'}`}>
+                {lineIdx + 1}
+              </div>
+              <div className="flex-1">
+                {chars.map((char, colIdx) => {
+                  const isCursor = isCurrentLine && cursor.col === colIdx;
+                  const selected = isSelected(lineIdx, colIdx);
+                  let charClass = getHighlightClass(char, line, inComment);
+                  let wrapperClass = '';
+
+                  if (selected) { wrapperClass = 'bg-[#3b5070] text-white'; charClass = ''; }
+                  if (isCursor) {
+                    if (mode === 'NORMAL' || mode === 'VISUAL') {
+                      wrapperClass = 'bg-[#ffeb3b] text-black font-bold animate-pulse-fast'; charClass = '';
+                    } else if (mode === 'INSERT') {
+                      wrapperClass = char === '' 
+                        ? 'border-l-2 border-[#ffeb3b] animate-pulse-fast'
+                        : 'border-l-2 border-[#ffeb3b] -ml-[2px] animate-pulse-fast';
+                    }
+                  }
+
+                  return (
+                    <span key={colIdx} className={`${wrapperClass} ${charClass}`}>
+                      {char === ' ' ? '\u00A0' : char}
+                      {char === '' && '\u00A0'}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        });
+      };
+
+      return (
+        <div className="flex flex-col md:flex-row h-screen bg-[#010409] text-[#c9d1d9] font-sans selection:bg-[#3b5070]">
+          
+          {/* AI 互動視窗 */}
+          {aiModal === 'gen' && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+              <div className="bg-[#161b22] border border-[#30363d] p-6 rounded-xl shadow-2xl w-full max-w-lg mx-4">
+                <h3 className="text-xl font-bold text-white mb-4 flex items-center">
+                  <span className="text-yellow-500 mr-2">✨</span> AI Code Generator
+                </h3>
+                <input 
+                  autoFocus
+                  type="text"
+                  placeholder="e.g. Write a function to reverse a string..."
+                  className="w-full bg-[#0d1117] border border-[#30363d] text-white p-3 rounded-lg outline-none focus:border-yellow-500 transition-colors mb-4"
+                  value={aiPrompt}
+                  onChange={(e) => setAiPrompt(e.target.value)}
+                  onKeyDown={(e) => {
+                    e.stopPropagation();
+                    if (e.key === 'Enter') handleGenerateCode();
+                    if (e.key === 'Escape') { setAiModal(null); containerRef.current?.focus(); }
+                  }}
+                />
+                <div className="flex justify-end space-x-3">
+                  <button onClick={() => { setAiModal(null); containerRef.current?.focus(); }} className="px-4 py-2 text-[#8b949e] hover:text-white transition-colors">Cancel</button>
+                  <button onClick={handleGenerateCode} disabled={aiLoading} className="px-4 py-2 bg-yellow-500 hover:bg-yellow-400 text-black font-bold rounded-lg transition-colors flex items-center">
+                    {aiLoading ? 'Generating...' : '✨ Generate'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {aiModal === 'explain_result' && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+              <div className="bg-[#161b22] border border-[#30363d] p-6 rounded-xl shadow-2xl w-full max-w-2xl mx-4 max-h-[80vh] flex flex-col">
+                <h3 className="text-xl font-bold text-white mb-4 flex items-center shrink-0">
+                  <span className="text-purple-400 mr-2">✨</span> AI Code Explanation
+                </h3>
+                <div className="flex-1 overflow-y-auto bg-[#0d1117] border border-[#30363d] p-5 rounded-lg text-sm text-[#c9d1d9] whitespace-pre-wrap leading-relaxed">
+                  {aiLoading ? (
+                    <div className="flex items-center text-[#8b949e]"><span className="animate-pulse mr-2 text-purple-400">✨</span> Analyzing code structure...</div>
+                  ) : (
+                    aiResponse
+                  )}
+                </div>
+                <div className="flex justify-end mt-4 shrink-0">
+                  <button onClick={() => { setAiModal(null); containerRef.current?.focus(); }} className="px-5 py-2 bg-[#21262d] hover:bg-[#30363d] text-white font-bold rounded-lg transition-colors border border-[#30363d]">
+                    Close
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 編輯器區域 */}
+          <div className="flex-1 p-2 md:p-4 flex flex-col min-h-[60vh] relative">
+            <div className="flex items-center justify-between mb-2 px-2">
+              <div className="flex items-center">
+                <div className="w-3 h-3 rounded-full bg-[#ff5f56] mr-2"></div>
+                <div className="w-3 h-3 rounded-full bg-[#ffbd2e] mr-2"></div>
+                <div className="w-3 h-3 rounded-full bg-[#27c93f] mr-4"></div>
+                <span className="text-[#8b949e] text-xs font-mono">~ / project / index.js</span>
+              </div>
+              <div className="flex space-x-2 items-center">
+                <button 
+                  onClick={() => handleExplainCode()}
+                  className="text-[10px] bg-[#3b5070]/30 hover:bg-[#3b5070] text-[#a5d6ff] px-2 py-1 rounded font-bold uppercase transition-colors border border-[#3b5070]"
+                  title="Explain current line or visual selection"
+                >
+                  ✨ Explain
+                </button>
+                <button 
+                  onClick={() => setAiModal('gen')}
+                  className="text-[10px] bg-yellow-500/20 hover:bg-yellow-500/40 text-yellow-500 px-2 py-1 rounded font-bold uppercase transition-colors border border-yellow-500/30"
+                  title="Generate code at cursor position"
+                >
+                  ✨ Generate
+                </button>
+                <span className="text-xs bg-gradient-to-r from-yellow-500 to-orange-500 text-black px-2 py-0.5 rounded font-bold uppercase ml-2 hidden sm:block">Ultimate</span>
+              </div>
+            </div>
+            
+            <div 
+              ref={containerRef}
+              tabIndex={0}
+              onKeyDown={handleKeyDown}
+              onFocus={() => setIsFocused(true)}
+              onBlur={() => setIsFocused(false)}
+              className={`flex-1 bg-[#0d1117] border rounded-lg py-4 overflow-hidden outline-none transition-all duration-300 ${
+                isFocused ? 'border-[#30363d] shadow-[0_0_30px_rgba(255,235,59,0.05)]' : 'border-[#21262d]'
+              }`}
+            >
+              {!isFocused && (
+                <div className="absolute inset-0 z-10 flex items-center justify-center bg-[#010409]/80 backdrop-blur-sm rounded-lg mx-2 md:mx-4 mt-8 mb-10">
+                  <div className="bg-[#161b22] p-8 rounded-2xl border border-[#30363d] text-center cursor-pointer hover:border-yellow-500/50 hover:shadow-[0_0_20px_rgba(255,235,59,0.1)] transition-all group" onClick={() => containerRef.current?.focus()}>
+                    <div className="text-5xl mb-4 grayscale group-hover:grayscale-0 transition-all">🔥</div>
+                    <h3 className="text-2xl font-bold text-white mb-2 font-mono">Enter The Matrix</h3>
+                    <p className="text-[#8b949e] text-sm">Focus Editor to start hacking</p>
+                  </div>
+                </div>
+              )}
+              <div className="font-mono text-[14px] tracking-wide leading-relaxed">
+                {renderText()}
+              </div>
+              {text.length > LINES_PER_PAGE && (
+                <div className="absolute right-6 top-16 bottom-20 w-1 bg-[#21262d] rounded-full overflow-hidden">
+                  <div 
+                    className="w-full bg-[#484f58] rounded-full transition-all duration-200"
+                    style={{
+                      height: `${(LINES_PER_PAGE / text.length) * 100}%`,
+                      marginTop: `${(scrollOffset / text.length) * 100}%`
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+
+            <div className="mt-2 flex items-center justify-between bg-[#0d1117] px-4 py-1.5 rounded font-mono text-xs border border-[#30363d]">
+              <div className="flex items-center space-x-4">
+                <span className={`font-bold px-2 py-0.5 rounded text-black ${
+                  mode === 'NORMAL' ? 'bg-[#58a6ff]' : mode === 'INSERT' ? 'bg-[#3fb950]' : 'bg-[#d2a8ff]'
+                }`}>
+                  {mode}
+                </span>
+                {displayBufferStr && (
+                  <span className="text-[#ffeb3b] font-bold tracking-widest">
+                    {displayBufferStr}<span className="animate-pulse opacity-70">_</span>
+                  </span>
+                )}
+              </div>
+              <div className="flex space-x-6 text-[#8b949e]">
+                <span>{Math.round(((scrollOffset + LINES_PER_PAGE) / text.length) * 100)}%</span>
+                <span>{cursor.line + 1}:{cursor.col + 1}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* 小抄區域 */}
+          <div className="w-full md:w-[340px] bg-[#0d1117] border-l border-[#21262d] p-5 overflow-y-auto">
+            <h3 className="text-[10px] uppercase tracking-widest font-bold text-[#ffeb3b] mb-4 flex items-center">
+              <span className="w-full border-t border-[#30363d] mr-2"></span>
+              Vim Ultimate Cheatsheet
+              <span className="w-full border-t border-[#30363d] ml-2"></span>
+            </h3>
+            
+            <div className="space-y-5">
+              
+              <div className="p-3 rounded-lg bg-gradient-to-br from-[#161b22] to-[#0d1117] border border-yellow-500/20 relative overflow-hidden">
+                <div className="absolute top-0 right-0 w-16 h-16 bg-yellow-500/5 rounded-bl-full"></div>
+                <h4 className="font-bold text-white mb-2 text-sm">💎 Text Objects (文字物件)</h4>
+                <p className="text-[11px] text-[#8b949e] mb-3 leading-relaxed">
+                  Vim 的精髓。直接對游標所在的「語意區塊」進行操作，無需精準移動。
+                </p>
+                <div className="space-y-2 text-xs font-mono">
+                  <div className="flex justify-between items-center border-b border-[#30363d] pb-1">
+                    <span className="text-[#e6edf3]"><b>c</b> <span className="text-yellow-500">iw</span></span>
+                    <span className="text-[#8b949e]">改寫當前單字</span>
+                  </div>
+                  <div className="flex justify-between items-center border-b border-[#30363d] pb-1">
+                    <span className="text-[#e6edf3]"><b>d</b> <span className="text-yellow-500">iw</span></span>
+                    <span className="text-[#8b949e]">刪除當前單字</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-[#e6edf3]"><b>y</b> <span className="text-yellow-500">iw</span></span>
+                    <span className="text-[#8b949e]">複製當前單字</span>
+                  </div>
+                </div>
+                <p className="text-[10px] text-[#484f58] mt-2 italic">* i = inner, w = word</p>
+              </div>
+
+              <div className={`p-3 rounded-lg border transition-colors ${mode === 'VISUAL' ? 'bg-[#3b5070]/20 border-[#d2a8ff]/50' : 'bg-[#161b22] border-[#30363d]'}`}>
+                <h4 className="font-bold text-white mb-2 text-sm text-[#d2a8ff]">👁️ Visual Mode</h4>
+                <ul className="text-xs space-y-1.5 text-[#8b949e]">
+                  <li>按 <kbd className="text-[#d2a8ff] font-bold">v</kbd> 進入，使用 <kbd>h j k l</kbd> 選取</li>
+                  <li>選取後按 <kbd className="text-white font-bold">d</kbd> 刪除</li>
+                  <li>選取後按 <kbd className="text-white font-bold">y</kbd> 複製</li>
+                </ul>
+              </div>
+
+              <div className="p-3 rounded-lg bg-[#161b22] border border-[#30363d]">
+                <h4 className="font-bold text-white mb-2 text-sm text-[#58a6ff]">🚀 飛速移動</h4>
+                <div className="grid grid-cols-2 gap-y-2 text-xs text-[#8b949e]">
+                  <div><kbd className="text-white">gg</kbd> 檔案頂端</div>
+                  <div><kbd className="text-white">G</kbd> 檔案底端</div>
+                  <div><kbd className="text-white">Ctrl+u</kbd> 上半頁</div>
+                  <div><kbd className="text-white">Ctrl+d</kbd> 下半頁</div>
+                </div>
+              </div>
+
+              <div className="p-3 rounded-lg bg-[#161b22] border border-[#30363d]">
+                <h4 className="font-bold text-white mb-2 text-sm text-[#8b949e]">📌 經典回顧</h4>
+                <ul className="text-[11px] space-y-1 text-[#8b949e] font-mono">
+                  <li><kbd>I</kbd> / <kbd>A</kbd> : 行首/尾輸入</li>
+                  <li><kbd>o</kbd> / <kbd>O</kbd> : 下/上方開新行輸入</li>
+                  <li><kbd>dd</kbd> / <kbd>yy</kbd> : 刪除/複製整行</li>
+                  <li><kbd>p</kbd> / <kbd>P</kbd> : 貼上</li>
+                  <li><kbd>u</kbd> / <kbd>Ctrl+r</kbd> : 復原/重做</li>
+                </ul>
+              </div>
+              
+            </div>
+          </div>
+        </div>
+      );
+    };
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(VimPracticeTool));
+  </script>
+</body>
+</html>
