@@ -1,0 +1,591 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+
+const initialText = [
+  "Advanced Vim Practice Tool - Level 2",
+  "",
+  "1. 數字前綴 (Count) - 試著輸入數字再加指令:",
+  "   按 3w 可以一次跳 3 個單字。",
+  "   按 2dd 可以一次刪除 2 行。",
+  "   按 4x 可以連續刪除 4 個字元。",
+  "",
+  "2. 進階插入 (Advanced Insert):",
+  "   按 I (大寫) 直接跳到行首開始輸入。",
+  "   按 A (大寫) 直接跳到行尾開始輸入。",
+  "   按 O (大寫) 在「上方」新增一行並輸入。",
+  "   按 o (小寫) 在「下方」新增一行並輸入。",
+  "",
+  "3. 複製與貼上 (Yank & Put):",
+  "   按 yy 可以複製 (Yank) 當前整行。",
+  "   按 p (小寫) 在游標下方貼上。",
+  "   按 P (大寫) 在游標上方貼上。",
+  "   (試著複製這行然後按 p 貼上看看)",
+  "",
+  "4. 行內尋找 (Find):",
+  "   按 f 再按任意字元，游標會跳到該字元。",
+  "   例如: 按 fx 會跳到這行的第一個 x 字元。",
+  "",
+  "5. 復原與重做:",
+  "   按 u 是復原 (Undo)。",
+  "   按 Ctrl + r 是重做 (Redo)。",
+  "",
+  "Keep hacking!"
+];
+
+const VimPracticeTool = () => {
+  const [text, setText] = useState([...initialText]);
+  const [cursor, setCursor] = useState({ line: 0, col: 0 });
+  const [mode, setMode] = useState('NORMAL'); // NORMAL, INSERT
+  
+  // 指令緩衝區結構：{ count: 數字前綴, cmd: 累積的字母指令 }
+  const [commandBuffer, setCommandBuffer] = useState({ count: '', cmd: '' });
+  
+  // Undo/Redo 系統
+  const [history, setHistory] = useState([]); 
+  const [redoStack, setRedoStack] = useState([]);
+  
+  // 暫存器 (暫時只支援存整行)
+  const [register, setRegister] = useState(null); 
+  
+  const [isFocused, setIsFocused] = useState(false);
+  const containerRef = useRef(null);
+
+  // 儲存狀態以供復原
+  const saveHistory = useCallback(() => {
+    setHistory(prev => [...prev, { text: [...text], cursor: { ...cursor } }]);
+    setRedoStack([]); // 執行新動作時清空 redo
+  }, [text, cursor]);
+
+  const clampCol = (lineIdx, colIdx, currentText = text, currentMode = mode) => {
+    const lineStr = currentText[lineIdx] || "";
+    const maxCol = currentMode === 'INSERT' ? lineStr.length : Math.max(0, lineStr.length - 1);
+    return Math.max(0, Math.min(colIdx, maxCol));
+  };
+
+  const handleKeyDown = (e) => {
+    if (!isFocused) return;
+    
+    if ([' ', 'Backspace', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key) || 
+        (e.ctrlKey && ['r', 'd', 'c', 'v'].includes(e.key))) {
+      e.preventDefault();
+    }
+
+    if (mode === 'NORMAL') {
+      handleNormalModeKey(e);
+    } else if (mode === 'INSERT') {
+      handleInsertModeKey(e);
+    }
+  };
+
+  // ----- 一般模式邏輯 -----
+  const handleNormalModeKey = (e) => {
+    const { key, ctrlKey, shiftKey } = e;
+    let newCursor = { ...cursor };
+    let newText = [...text];
+    let bufCountStr = commandBuffer.count;
+    let bufCmd = commandBuffer.cmd;
+
+    // --- 優先處理 Ctrl 快捷鍵 ---
+    if (ctrlKey && key === 'r') { // Redo
+      if (redoStack.length > 0) {
+        const nextState = redoStack[redoStack.length - 1];
+        setHistory(prev => [...prev, { text: [...text], cursor: { ...cursor } }]);
+        setText(nextState.text);
+        setCursor(nextState.cursor);
+        setRedoStack(prev => prev.slice(0, -1));
+      }
+      return;
+    }
+
+    // --- Esc 取消 ---
+    if (key === 'Escape') {
+      setCommandBuffer({ count: '', cmd: '' });
+      return;
+    }
+
+    // --- 收集數字前綴 (Count) ---
+    // 只有在還沒輸入指令字母，且輸入的是數字 (不能是開頭的 0，因為 0 是跳到行首)
+    if (!bufCmd && /^[1-9]$/.test(key) && bufCountStr === '') {
+      setCommandBuffer({ ...commandBuffer, count: key });
+      return;
+    } else if (!bufCmd && /^[0-9]$/.test(key) && bufCountStr !== '') {
+      setCommandBuffer({ ...commandBuffer, count: bufCountStr + key });
+      return;
+    }
+
+    // 解析 Count (預設為 1)
+    const count = parseInt(bufCountStr) || 1;
+
+    // --- 處理等待字元輸入的指令 (例如 f{char}) ---
+    if (bufCmd === 'f') {
+      if (key.length === 1) { // 確保輸入的是單一字元
+        const lineStr = text[cursor.line];
+        let foundIdx = cursor.col;
+        let matchCount = 0;
+        
+        // 往右尋找第 n 個字元
+        for (let i = cursor.col + 1; i < lineStr.length; i++) {
+          if (lineStr[i] === key) {
+            matchCount++;
+            if (matchCount === count) {
+              foundIdx = i;
+              break;
+            }
+          }
+        }
+        newCursor.col = foundIdx;
+        setCursor(newCursor);
+      }
+      setCommandBuffer({ count: '', cmd: '' });
+      return;
+    }
+
+    // --- 處理 d 和 y 的組合鍵 ---
+    if (bufCmd === 'd' || bufCmd === 'y') {
+      if (key === bufCmd) { // dd 或 yy
+        if (bufCmd === 'd') saveHistory();
+        
+        // 處理刪除/複製多行
+        const linesToProcess = Math.min(count, newText.length - cursor.line);
+        const extractedLines = newText.slice(cursor.line, cursor.line + linesToProcess);
+        
+        // 存入暫存器 (整行模式)
+        setRegister({ type: 'line', content: extractedLines });
+        
+        if (bufCmd === 'd') {
+          newText.splice(cursor.line, linesToProcess);
+          if (newText.length === 0) newText.push(""); 
+          newCursor.line = Math.min(cursor.line, newText.length - 1);
+          newCursor.col = clampCol(newCursor.line, 0, newText, 'NORMAL');
+          setText(newText);
+          setCursor(newCursor);
+        }
+      } else if (key === 'w' && bufCmd === 'd') { // dw
+        saveHistory();
+        let currentLineStr = newText[cursor.line];
+        let delStart = cursor.col;
+        let delEnd = cursor.col;
+        
+        for (let i = 0; i < count; i++) {
+           while (delEnd < currentLineStr.length && currentLineStr[delEnd] !== ' ') delEnd++;
+           while (delEnd < currentLineStr.length && currentLineStr[delEnd] === ' ') delEnd++;
+        }
+        
+        // 為了簡單起見，這裡 dw 不跨行刪除
+        newText[cursor.line] = currentLineStr.substring(0, delStart) + currentLineStr.substring(delEnd);
+        newCursor.col = clampCol(cursor.line, delStart, newText, 'NORMAL');
+        setText(newText);
+        setCursor(newCursor);
+      }
+      setCommandBuffer({ count: '', cmd: '' });
+      return;
+    }
+
+
+    // --- 處理單鍵 / 啟動指令 ---
+    let handled = true;
+    switch (key) {
+      // 啟動組合鍵
+      case 'd':
+      case 'y':
+      case 'f':
+        setCommandBuffer({ ...commandBuffer, cmd: key });
+        return; // 不清空 buffer
+        
+      // 移動
+      case 'h': case 'ArrowLeft':
+        newCursor.col = Math.max(0, cursor.col - count);
+        break;
+      case 'l': case 'ArrowRight':
+        newCursor.col = clampCol(cursor.line, cursor.col + count, text, 'NORMAL');
+        break;
+      case 'j': case 'ArrowDown':
+        newCursor.line = Math.min(text.length - 1, cursor.line + count);
+        newCursor.col = clampCol(newCursor.line, cursor.col, text, 'NORMAL');
+        break;
+      case 'k': case 'ArrowUp':
+        newCursor.line = Math.max(0, cursor.line - count);
+        newCursor.col = clampCol(newCursor.line, cursor.col, text, 'NORMAL');
+        break;
+      case '0':
+        newCursor.col = 0;
+        break;
+      case '$':
+        newCursor.col = clampCol(cursor.line, text[cursor.line].length, text, 'NORMAL');
+        break;
+      case 'w': {
+        // 簡單實作多重 jump
+        let tempCursor = { ...cursor };
+        for (let i = 0; i < count; i++) {
+            const lineStr = text[tempCursor.line];
+            let nextIdx = tempCursor.col + 1;
+            while (nextIdx < lineStr.length && lineStr[nextIdx] !== ' ') nextIdx++;
+            while (nextIdx < lineStr.length && lineStr[nextIdx] === ' ') nextIdx++;
+            
+            if (nextIdx >= lineStr.length && tempCursor.line < text.length - 1) {
+              tempCursor.line += 1;
+              tempCursor.col = 0;
+            } else {
+              tempCursor.col = clampCol(tempCursor.line, nextIdx, text, 'NORMAL');
+            }
+        }
+        newCursor = tempCursor;
+        break;
+      }
+      case 'b': {
+        let tempCursor = { ...cursor };
+        for (let i = 0; i < count; i++) {
+            let prevIdx = tempCursor.col - 1;
+            const lineStr = text[tempCursor.line];
+            while (prevIdx >= 0 && lineStr[prevIdx] === ' ') prevIdx--;
+            while (prevIdx >= 0 && lineStr[prevIdx] !== ' ') prevIdx--;
+            
+            if (prevIdx < 0 && tempCursor.line > 0) {
+              tempCursor.line -= 1;
+              tempCursor.col = clampCol(tempCursor.line, text[tempCursor.line].length, text, 'NORMAL');
+            } else {
+              tempCursor.col = prevIdx + 1;
+            }
+        }
+        newCursor = tempCursor;
+        break;
+      }
+      
+      // 編輯
+      case 'x':
+        if (text[cursor.line].length > 0) {
+          saveHistory();
+          const lineStr = newText[cursor.line];
+          const delCount = Math.min(count, lineStr.length - cursor.col);
+          newText[cursor.line] = lineStr.slice(0, cursor.col) + lineStr.slice(cursor.col + delCount);
+          newCursor.col = clampCol(cursor.line, cursor.col, newText, 'NORMAL');
+          setText(newText);
+        }
+        break;
+        
+      // 貼上
+      case 'p':
+        if (register && register.type === 'line') {
+          saveHistory();
+          let insertIdx = cursor.line + 1;
+          
+          // 複製 count 次
+          for(let c=0; c < count; c++) {
+              newText.splice(insertIdx, 0, ...register.content);
+              insertIdx += register.content.length;
+          }
+          newCursor.line = cursor.line + 1;
+          newCursor.col = clampCol(newCursor.line, 0, newText, 'NORMAL');
+          setText(newText);
+        }
+        break;
+      case 'P':
+        if (register && register.type === 'line') {
+          saveHistory();
+          let insertIdx = cursor.line;
+          for(let c=0; c < count; c++) {
+              newText.splice(insertIdx, 0, ...register.content);
+              insertIdx += register.content.length;
+          }
+          newCursor.line = cursor.line;
+          newCursor.col = clampCol(newCursor.line, 0, newText, 'NORMAL');
+          setText(newText);
+        }
+        break;
+
+      // 模式切換 (Insert)
+      case 'i':
+        setMode('INSERT');
+        break;
+      case 'I':
+        newCursor.col = 0;
+        setMode('INSERT');
+        break;
+      case 'a':
+        newCursor.col = Math.min(text[cursor.line].length, cursor.col + 1);
+        setMode('INSERT');
+        break;
+      case 'A':
+        newCursor.col = text[cursor.line].length;
+        setMode('INSERT');
+        break;
+      case 'o':
+        saveHistory();
+        newText.splice(cursor.line + 1, 0, "");
+        newCursor.line += 1;
+        newCursor.col = 0;
+        setText(newText);
+        setMode('INSERT');
+        break;
+      case 'O':
+        saveHistory();
+        newText.splice(cursor.line, 0, "");
+        newCursor.col = 0;
+        setText(newText);
+        setMode('INSERT');
+        break;
+
+      // Undo
+      case 'u':
+        if (history.length > 0) {
+          const lastState = history[history.length - 1];
+          setRedoStack(prev => [...prev, { text: [...text], cursor: { ...cursor } }]);
+          setText(lastState.text);
+          setCursor(lastState.cursor);
+          setHistory(history.slice(0, -1));
+        }
+        break;
+        
+      default:
+        handled = false;
+        break;
+    }
+    
+    if (handled) {
+      setCursor(newCursor);
+      setCommandBuffer({ count: '', cmd: '' }); // 成功執行單鍵指令後清空 buffer
+    }
+  };
+
+  // ----- 插入模式邏輯 -----
+  const handleInsertModeKey = (e) => {
+    const { key } = e;
+    let newCursor = { ...cursor };
+    let newText = [...text];
+
+    if (key === 'Escape') {
+      setMode('NORMAL');
+      setCursor({ ...cursor, col: Math.max(0, cursor.col - 1) });
+      return;
+    }
+
+    saveHistory(); 
+
+    if (key === 'Backspace') {
+      if (cursor.col > 0) {
+        const lineStr = newText[cursor.line];
+        newText[cursor.line] = lineStr.slice(0, cursor.col - 1) + lineStr.slice(cursor.col);
+        newCursor.col -= 1;
+        setText(newText);
+        setCursor(newCursor);
+      } else if (cursor.line > 0) {
+        const prevLineLen = newText[cursor.line - 1].length;
+        newText[cursor.line - 1] += newText[cursor.line];
+        newText.splice(cursor.line, 1);
+        newCursor.line -= 1;
+        newCursor.col = prevLineLen;
+        setText(newText);
+        setCursor(newCursor);
+      }
+    } else if (key === 'Enter') {
+      const lineStr = newText[cursor.line];
+      const nextLineStr = lineStr.slice(cursor.col);
+      newText[cursor.line] = lineStr.slice(0, cursor.col);
+      newText.splice(cursor.line + 1, 0, nextLineStr);
+      newCursor.line += 1;
+      newCursor.col = 0;
+      setText(newText);
+      setCursor(newCursor);
+    } else if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      const lineStr = newText[cursor.line];
+      newText[cursor.line] = lineStr.slice(0, cursor.col) + key + lineStr.slice(cursor.col);
+      newCursor.col += 1;
+      setText(newText);
+      setCursor(newCursor);
+    } else {
+      setHistory(prev => prev.slice(0, -1));
+    }
+  };
+
+  // ----- 渲染 -----
+  const displayBufferStr = `${commandBuffer.count}${commandBuffer.cmd}`;
+
+  const renderText = () => {
+    return text.map((line, lineIdx) => {
+      const isCurrentLine = cursor.line === lineIdx;
+      
+      if (line.length === 0) {
+        if (isCurrentLine) {
+          return (
+            <div key={lineIdx} className={`h-6 leading-6 ${isCurrentLine ? 'bg-gray-800' : ''}`}>
+              <span className={`inline-block ${mode === 'NORMAL' ? 'bg-green-400 opacity-80 w-2.5 h-5 align-middle' : 'border-l-2 border-green-400 h-5 inline-block align-middle'}`}>&nbsp;</span>
+            </div>
+          );
+        }
+        return <div key={lineIdx} className="h-6 leading-6 text-gray-700">~</div>;
+      }
+
+      const chars = line.split('');
+      if (mode === 'INSERT' && isCurrentLine && cursor.col === line.length) {
+        chars.push(''); 
+      }
+
+      return (
+        <div key={lineIdx} className={`h-6 leading-6 whitespace-pre font-mono ${isCurrentLine ? 'bg-gray-800/80' : ''}`}>
+          {chars.map((char, colIdx) => {
+            const isCursor = isCurrentLine && cursor.col === colIdx;
+            let cursorClass = '';
+            if (isCursor) {
+              if (mode === 'NORMAL') {
+                cursorClass = 'bg-green-400 text-gray-900 font-bold'; 
+              } else if (mode === 'INSERT') {
+                if (char === '') {
+                  cursorClass = 'border-l-2 border-green-400 animate-pulse';
+                } else {
+                  cursorClass = 'border-l-2 border-green-400 -ml-[2px] animate-pulse';
+                }
+              }
+            }
+
+            return (
+              <span key={colIdx} className={cursorClass}>
+                {char === ' ' ? '\u00A0' : char}
+                {char === '' && '\u00A0'}
+              </span>
+            );
+          })}
+        </div>
+      );
+    });
+  };
+
+  return (
+    <div className="flex flex-col md:flex-row h-screen bg-[#0d1117] text-[#c9d1d9] font-sans">
+      
+      {/* 編輯器區域 */}
+      <div className="flex-1 p-4 md:p-6 flex flex-col min-h-[60vh] relative">
+        <h2 className="text-xl font-bold text-[#e6edf3] mb-3 flex items-center">
+          <span className="text-green-500 mr-2">❯</span> Vim Simulator <span className="ml-2 text-xs bg-purple-600/30 text-purple-400 px-2 py-1 rounded border border-purple-500/30">v2.0 Advanced</span>
+        </h2>
+        
+        <div 
+          ref={containerRef}
+          tabIndex={0}
+          onKeyDown={handleKeyDown}
+          onFocus={() => setIsFocused(true)}
+          onBlur={() => setIsFocused(false)}
+          className={`flex-1 bg-[#161b22] border rounded-lg p-4 overflow-y-auto outline-none transition-all duration-200 ${
+            isFocused ? 'border-green-500/50 shadow-[0_0_20px_rgba(34,197,94,0.1)]' : 'border-[#30363d]'
+          }`}
+        >
+          {!isFocused && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-[#0d1117]/70 backdrop-blur-sm rounded-lg mx-4 md:mx-6 mt-12 mb-14">
+              <div className="bg-[#21262d] px-8 py-6 rounded-xl shadow-2xl border border-[#30363d] text-center cursor-pointer hover:bg-[#30363d] transition-colors" onClick={() => containerRef.current?.focus()}>
+                <div className="text-4xl mb-3">⚡</div>
+                <p className="text-xl font-bold text-white">點擊進入駭客模式</p>
+                <p className="text-[#8b949e] text-sm mt-2">Activate Editor Focus</p>
+              </div>
+            </div>
+          )}
+
+          <div className="font-mono text-[15px] tracking-wide leading-relaxed">
+            {renderText()}
+          </div>
+        </div>
+
+        {/* 狀態列 */}
+        <div className="mt-2 flex items-center justify-between bg-[#161b22] px-4 py-1.5 rounded-b-md font-mono text-sm border-t-2 border-[#30363d] shadow-sm">
+          <div className="flex items-center space-x-4">
+            <span className={`font-bold px-2 py-0.5 uppercase tracking-wider text-xs ${
+              mode === 'NORMAL' ? 'text-blue-400' : 'text-green-400'
+            }`}>
+              {mode}
+            </span>
+            {displayBufferStr && (
+              <span className="text-yellow-400 flex items-center">
+                <span className="text-[#8b949e] mr-2">Cmd:</span> {displayBufferStr}
+                <span className="animate-pulse w-2 h-4 bg-yellow-400 ml-1 inline-block"></span>
+              </span>
+            )}
+          </div>
+          <div className="flex space-x-6 text-[#8b949e]">
+            {register && <span className="text-purple-400" title="Register full">[{register.type}]</span>}
+            <span>{cursor.line + 1},{cursor.col + 1}</span>
+          </div>
+        </div>
+      </div>
+
+      {/* 小抄區域 */}
+      <div className="w-full md:w-80 bg-[#161b22] border-l border-[#30363d] p-5 overflow-y-auto custom-scrollbar">
+        <h3 className="text-base uppercase tracking-wider font-bold text-[#8b949e] mb-4 pb-2 border-b border-[#30363d]">Cheatsheet v2.0</h3>
+        
+        <div className="space-y-4">
+          
+          {/* 強力組合 */}
+          <div className="p-3 rounded bg-[#21262d] border border-yellow-900/30">
+            <h4 className="font-bold text-[#e6edf3] mb-2 text-sm flex items-center">
+              <span className="text-yellow-500 mr-2">★</span> 數字前綴 (Count)
+            </h4>
+            <p className="text-xs text-[#8b949e] mb-2 font-mono">[數字] + [指令]</p>
+            <ul className="text-xs space-y-1 text-[#8b949e] font-mono">
+              <li><span className="text-[#c9d1d9]">3w</span> 跳 3 個單字</li>
+              <li><span className="text-[#c9d1d9]">2dd</span> 刪除 2 行</li>
+              <li><span className="text-[#c9d1d9]">4x</span> 刪除 4 個字元</li>
+            </ul>
+          </div>
+
+          {/* 進階插入 */}
+          <div className={`p-3 rounded border ${mode === 'INSERT' ? 'bg-green-900/10 border-green-500/30' : 'bg-[#21262d] border-[#30363d]'}`}>
+            <h4 className="font-bold text-[#e6edf3] mb-2 text-sm">🔄 進階插入</h4>
+            <div className="grid grid-cols-2 gap-2 text-xs font-mono">
+              <div className="text-[#8b949e]"><span className="text-green-400 font-bold">i</span> 游標前</div>
+              <div className="text-[#8b949e]"><span className="text-green-400 font-bold">a</span> 游標後</div>
+              <div className="text-[#8b949e]"><span className="text-green-400 font-bold">I</span> 行首</div>
+              <div className="text-[#8b949e]"><span className="text-green-400 font-bold">A</span> 行尾</div>
+              <div className="text-[#8b949e]"><span className="text-green-400 font-bold">O</span> 上方新行</div>
+              <div className="text-[#8b949e]"><span className="text-green-400 font-bold">o</span> 下方新行</div>
+            </div>
+          </div>
+
+          {/* 複製貼上 */}
+          <div className="p-3 rounded bg-[#21262d] border border-[#30363d]">
+            <h4 className="font-bold text-[#e6edf3] mb-2 text-sm">📋 複製與貼上</h4>
+            <ul className="text-xs space-y-1.5 text-[#8b949e]">
+              <li><kbd className="bg-[#0d1117] text-[#c9d1d9] px-1 py-0.5 rounded font-mono border border-[#30363d]">yy</kbd> 複製當前行 (Yank)</li>
+              <li><kbd className="bg-[#0d1117] text-[#c9d1d9] px-1 py-0.5 rounded font-mono border border-[#30363d]">p</kbd> 貼在下方 (Put)</li>
+              <li><kbd className="bg-[#0d1117] text-[#c9d1d9] px-1 py-0.5 rounded font-mono border border-[#30363d]">P</kbd> 貼在上方</li>
+            </ul>
+          </div>
+
+          {/* 移動尋找 */}
+          <div className="p-3 rounded bg-[#21262d] border border-[#30363d]">
+            <h4 className="font-bold text-[#e6edf3] mb-2 text-sm">🧭 進階移動</h4>
+            <ul className="text-xs space-y-1.5 text-[#8b949e]">
+              <li><kbd className="bg-[#0d1117] text-[#c9d1d9] px-1 py-0.5 rounded font-mono border border-[#30363d]">f</kbd> + [字元] 行內尋找</li>
+              <li className="text-[10px] ml-1">ex: <code>fx</code> 會跳到行內下一個 x</li>
+              <li className="mt-2"><kbd className="bg-[#0d1117] text-[#c9d1d9] px-1 py-0.5 rounded font-mono border border-[#30363d]">0</kbd> 絕對行首</li>
+              <li><kbd className="bg-[#0d1117] text-[#c9d1d9] px-1 py-0.5 rounded font-mono border border-[#30363d]">$</kbd> 絕對行尾</li>
+            </ul>
+          </div>
+
+           {/* Undo/Redo */}
+           <div className="p-3 rounded bg-[#21262d] border border-[#30363d]">
+            <h4 className="font-bold text-[#e6edf3] mb-2 text-sm">⏪ 時光機</h4>
+            <ul className="text-xs space-y-1.5 text-[#8b949e]">
+              <li><kbd className="bg-[#0d1117] text-[#c9d1d9] px-1 py-0.5 rounded font-mono border border-[#30363d]">u</kbd> 復原 (Undo)</li>
+              <li><kbd className="bg-[#0d1117] text-[#c9d1d9] px-1 py-0.5 rounded font-mono border border-[#30363d]">Ctrl + r</kbd> 重做 (Redo)</li>
+            </ul>
+          </div>
+          
+        </div>
+      </div>
+      
+      <style dangerouslySetInnerHTML={{__html: `
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: #0d1117; 
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: #30363d; 
+          border-radius: 3px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background: #484f58; 
+        }
+      `}} />
+    </div>
+  );
+};
+
+export default VimPracticeTool;
